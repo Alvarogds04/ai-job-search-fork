@@ -1,0 +1,6 @@
+{
+  "include": ["."],
+  "extraPaths": ["."],
+  "reportMissingImports": "warning",
+  "reportMissingModuleSource": "none"
+}
