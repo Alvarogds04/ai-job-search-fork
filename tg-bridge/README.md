@@ -1,7 +1,7 @@
 # Telegram job-search bridge
 
 A small Python bridge that connects the `ai-job-search` framework to
-Telegram: daily Turijobs and LinkedIn searches, LLM-based fit evaluation against the
+Telegram: daily Turijobs, LinkedIn, Indeed and InfoJobs searches, LLM-based fit evaluation against the
 candidate profile, and offer delivery to the candidate's Telegram chat
 with Approve/Discard/Detail buttons.
 
@@ -56,7 +56,7 @@ Covered by `test_conversation.py`.
 | `config.py` | Loads `state/.env` into env with defaults |
 | `llm.py` | Minimal OpenAI-compatible client for the NAN API |
 | `candidate_profile.py` | Her profile (`state/profile.md`) + compact digest for prompt and fit |
-| `sources.py` | Turijobs/LinkedIn fetchers with explicit success, empty, blocked and failed states |
+| `sources.py` | Turijobs/LinkedIn/Indeed/InfoJobs fetchers with explicit success, empty, blocked and failed states |
 | `scraper.py` | Preference-based query planning, location filtering and detail fetch |
 | `state_store.py` | Locked per-record updates and atomic state-file replacement |
 | `resume.py` | Grounded CV selection and deterministic TXT/HTML rendering |
@@ -151,11 +151,32 @@ location filter. Query counts and preference lengths are bounded.
 
 Fetchers distinguish `ok`, `empty`, `blocked` and `failed`. The daily digest names
 failed sources and does not say everything is up to date when all sources fail.
-**Coverage is still Turijobs and LinkedIn.** No InfoJobs, Indeed or SEPE connector
-has been added. Official SEPE RSS endpoints could not be fetched during this
-implementation, so they are not advertised as working sources.
+**Indeed and InfoJobs** are connected but OFF by default; she enables them from
+the chat («activa Indeed», «activa InfoJobs») and they use `agregar_fuente` /
+`quitar_fuente` like the others. Indeed goes through `python-jobspy` (imported
+lazily: without it the source reports `failed` in the 09:00 digest and the bot
+keeps running). InfoJobs parses its public search page (port of the MIT
+`infojobs-search` connector, https://github.com/erikpr1994/ai-job-search, commit
+`0d019f2`). Both honour the location filter; descriptions come with the search
+result (Indeed) or from the offer page (InfoJobs), and a failed detail fetch
+follows the normal retry logic.
 
-Offline checks: `test_search_preferences.py`, `test_source_status.py`,
+**Terms of service / volume.** Both portals restrict automated access. This is
+personal use only: one page per query, at most 8 requests per portal per run, one
+retry on 429/5xx for InfoJobs, 15 s timeout. Do not raise these limits, use them
+commercially or collect in bulk. SEPE is still not connected (its RSS could not be
+fetched).
+
+**Python environment** (jobspy needs a venv, not the system python):
+
+```bash
+uv venv tg-bridge/.venv && uv pip install -p tg-bridge/.venv -r tg-bridge/requirements.txt
+```
+
+Point the systemd `ExecStart` lines at `tg-bridge/.venv/bin/python`. `.venv/` should
+be git-ignored.
+
+Offline checks: `test_search_preferences.py`, `test_source_status.py`, `test_new_sources.py`,
 `test_search_pipeline.py` and `test_state_store.py`. Run the full suite in an
 isolated source-only copy with no `.env` or live `state/`; legacy test scripts
 were not designed to run against production configuration.

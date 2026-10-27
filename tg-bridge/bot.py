@@ -32,7 +32,7 @@ ERROR_SLEEP = 10
 
 WELCOME = (
     "¡Hola! Soy tu asistente de búsqueda de empleo. 📋\n\n"
-    "Cada día buscaré ofertas nuevas (Turijobs y LinkedIn), las evaluaré "
+    "Cada día buscaré ofertas nuevas en tus portales activos, las evaluaré "
     "contra tu perfil y te enviaré las mejores con CV y carta preparados.\n\n"
     "Comandos:\n"
     "• /ofertas — ver ofertas nuevas\n"
@@ -44,9 +44,9 @@ WELCOME = (
     "• Escribe cualquier pregunta y te respondo.\n\n"
     "También puedes pedirme cambios de preferencias en lenguaje natural, "
     "por ejemplo «solo ofertas de hostelería» o «mándame más ofertas», y "
-    "puedes pedirme activar LinkedIn o desactivar Turijobs como portales "
+    "puedes pedirme activar o desactivar portales (Turijobs, LinkedIn, Indeed, InfoJobs) "
     "de búsqueda. Si me pides un portal que aún no está conectado "
-    "(InfoJobs, Indeed...), lo apunto en mis pendientes para activarlo.\n\n"
+    "(Jooble, Trovit...), lo apunto en mis pendientes para activarlo.\n\n"
     "Resuelvo yo misma todo lo que me pidas: si algo no puedo hacerlo, "
     "te lo explico con mis palabras y lo apunto en mis pendientes.\n\n"
     "Puedes contarme cambios de tu perfil (experiencia, idiomas, "
@@ -356,7 +356,7 @@ def _digest_text(
             )
         return (
             "🌅 Búsqueda de hoy: no hay ofertas nuevas de Madrid en "
-            "Turijobs y LinkedIn. Todo al día."
+            "tus portales. Todo al día."
         )
     top = _digest_listed(new_offers)
     lines = [f"🌅 <b>Búsqueda de hoy</b>: {new_count} ofertas nuevas{_where(source_report)}."]
@@ -658,8 +658,8 @@ def _build_system_prompt(user_text: str = "", history: list | None = None) -> st
         f"- {candidate_name()} también puede pedirte conectar o desconectar portales de "
         "empleo («activa LinkedIn», «desactiva Turijobs»). Portales "
         f"activos ahora mismo: {enabled_txt}.\n"
-        "- Si pide un portal que NO está conectado (InfoJobs, Indeed, "
-        "Jooble, Trovit...), NO emitas ninguna línea <<ACCION>>: "
+        "- Si pide un portal que NO está conectado (Jooble, "
+        "Trovit...), NO emitas ninguna línea <<ACCION>>: "
         "explícale con amabilidad que todavía no buscas en ese portal y "
         "que ya has apuntado su petición para activarlo, y termina tu "
         "respuesta con UNA única línea con este formato exacto:\n"

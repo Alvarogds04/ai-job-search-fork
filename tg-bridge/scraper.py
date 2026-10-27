@@ -37,7 +37,19 @@ def search_turijobs(query: str) -> list[dict]:
 
 
 def fetch_posting(url: str) -> str:
-    """Return readable text of one detail page ('' on failure)."""
+    """Return readable text of one detail page ('' on failure).
+
+    Indeed: the description captured at search time (no extra request).
+    InfoJobs: the offer description via its dedicated parser. Both end
+    with a 'Sobre la empresa <name>' line so parse_company keeps working.
+    """
+    cached = sources.cached_posting(url)
+    if cached and cached.get("text"):
+        return _with_company(cached["text"], cached.get("company", ""))
+    if "infojobs.net" in url:
+        text = sources.fetch_infojobs_detail(url)
+        company = (cached or {}).get("company", "")
+        return _with_company(text, company) if text else ""
     session = sources.make_session()
     try:
         response = session.get(url, timeout=30)
@@ -52,6 +64,10 @@ def fetch_posting(url: str) -> str:
         return ""
     body = re.sub(r"<(script|style).*?</\1>", " ", response.text, flags=re.DOTALL)
     return sources.clean(body)
+
+
+def _with_company(text: str, company: str) -> str:
+    return f"{text}\n\nSobre la empresa {company}" if company else text
 
 
 def parse_company(detail_text: str) -> str:
@@ -87,6 +103,7 @@ def mark_seen(*urls: str) -> None:
 
 REMOTE_MARKERS = ("teletrabajo", "remoto", "remote")
 MAX_REQUESTS_PER_SOURCE = 30  # hard bound per run per portal
+# Indeed/InfoJobs (ToS-sensitive, personal use) have lower per-run caps.
 
 
 def _fold(text: str) -> str:
@@ -189,9 +206,13 @@ def search_with_report() -> tuple[list[dict], dict]:
         aware = source_name in sources.LOCATION_AWARE
         places = fetch_places if aware and fetch_places else [None]
         requests_made = 0
+        cap = min(
+            MAX_REQUESTS_PER_SOURCE,
+            sources.MAX_REQUESTS_PER_RUN.get(source_name, MAX_REQUESTS_PER_SOURCE),
+        )
         for lane, query in plan:
             for place in places:
-                if requests_made >= MAX_REQUESTS_PER_SOURCE:
+                if requests_made >= cap:
                     break
                 requests_made += 1
                 result = fetch(query, place) if place else fetch(query)

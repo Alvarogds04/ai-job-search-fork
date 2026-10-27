@@ -61,9 +61,9 @@ def test_static_texts() -> None:
 def test_split_peticion_portal() -> None:
     """Existing portal queue keeps working exactly as before."""
     text, portal, request = bot._split_peticion(
-        'Ahora mismo no busco ahí.\n<<PETICION>>{"portal":"infojobs"}'
+        'Ahora mismo no busco ahí.\n<<PETICION>>{"portal":"jooble"}'
     )
-    check("portal request parsed", portal == "infojobs", repr(portal))
+    check("portal request parsed", portal == "jooble", repr(portal))
     check("generic text empty for portal request", request is None)
     check("peticion line stripped from reply", "PETICION" not in text, repr(text))
 
@@ -155,7 +155,7 @@ def test_record_request() -> None:
     path = os.path.join(_TMP_STATE, "requests.json")
     bot._record_request("Cambiar la hora de búsqueda")
     bot._record_request("cambiar la hora de BUSQUEDA")  # dedup: case/accents
-    bot._record_request("Añadir portal InfoJobs")
+    bot._record_request("Añadir portal Jooble")
 
     data = bot._read_json(bot.config.state_path("requests.json"), [])
     check("requests persisted", len(data) == 2, repr(data))

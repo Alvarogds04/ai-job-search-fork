@@ -21,10 +21,17 @@ LinkedIn guest endpoint (verified 2026-10-03, works without auth):
     max 1 request per query per run, and the caller sleeps 2s between
     requests. It can rate-limit (429) or block: on ANY failure return an empty SourceResult
 (a list subclass carrying status blocked/failed; see below).
+
+Indeed (python-jobspy) and InfoJobs (public server-rendered search) are
+PERSONAL-USE, LOW-VOLUME connectors. Their Terms of Service restrict
+automated access: at most one page per query, at most
+MAX_REQUESTS_PER_RUN requests per portal per run, no commercial use, no
+bulk collection. Both are off by default and toggled from the chat.
 """
 
 import re
 import sys
+import time
 import unicodedata
 from html import unescape
 
@@ -153,7 +160,12 @@ def make_session() -> requests.Session:
 
 def display_name(source: str) -> str:
     """Spanish-facing portal name ('turijobs' -> 'Turijobs')."""
-    return {"turijobs": "Turijobs", "linkedin": "LinkedIn"}.get(source, source)
+    return {
+        "turijobs": "Turijobs",
+        "linkedin": "LinkedIn",
+        "indeed": "Indeed",
+        "infojobs": "InfoJobs",
+    }.get(source, source)
 
 
 def search_turijobs(query: str, location: str | None = None) -> SourceResult:
@@ -280,15 +292,304 @@ def search_linkedin(query: str, location: str | None = None) -> SourceResult:
     return SourceResult(results)
 
 
+
+# ---------------------------------------------------------------- shared
+# Per-run request ceilings for the ToS-sensitive portals (the scraper
+# applies min(this, its own global bound)); keeps daily volume low.
+MAX_REQUESTS_PER_RUN = {"indeed": 8, "infojobs": 8}
+
+# Posting text captured at search time, keyed by offer URL, so the
+# evaluator needs no extra detail fetch (scraper.fetch_posting reads it).
+_POSTING_CACHE: dict[str, dict] = {}
+
+
+def cached_posting(url: str) -> dict | None:
+    return _POSTING_CACHE.get(url)
+
+
+def _is_remote_place(location) -> bool:
+    folded = unicodedata.normalize("NFKD", str(location or "").lower())
+    return any(m in folded for m in ("teletrabajo", "remoto", "remote"))
+
+
+def _text(value) -> str:
+    """Cell -> str; NaN/None/non-text (pandas missing values) -> ''."""
+    return value.strip() if isinstance(value, str) else ""
+
+
+# ---------------------------------------------------------------- Indeed
+_INDEED_JK_RE = re.compile(r"[?&]jk=([0-9A-Za-z]+)")
+_INDEED_RESULTS = 10
+_BLOCK_CODE_RE = re.compile(r"\b(403|429)\b")
+
+
+def _indeed_error_result(errors) -> SourceResult:
+    """Map jobspy's error list to blocked/failed with a short code only."""
+    blob = " ".join(str(e) for e in errors).lower()
+    code = _BLOCK_CODE_RE.search(blob)
+    if code:
+        return _failure(STATUS_BLOCKED, f"http_{code.group(1)}")
+    if "forbidden" in blob or "captcha" in blob or "blocked" in blob:
+        return _failure(STATUS_BLOCKED, "blocked")
+    return _failure(STATUS_FAILED, "scrape_error")
+
+
+def search_indeed(query: str, location: str | None = None) -> SourceResult:
+    """One Indeed (Spain) query through python-jobspy; never raises.
+
+    jobspy is imported lazily so the bot keeps running under a python
+    without it (-> failed 'jobspy_missing'). Description text comes with
+    the result, so no detail fetch is needed.
+    """
+    term = " ".join(str(query).split())
+    if not term:
+        return _failure(STATUS_FAILED, "invalid_query")
+    if " " in term and not (term.startswith('"') and term.endswith('"')):
+        term = f'"{term}"'
+    place = location if location and not _is_remote_place(location) else DEFAULT_LOCATION
+    try:
+        from jobspy import scrape_jobs  # type: ignore[reportMissingImports]
+    except ImportError:
+        print("[sources] indeed unavailable: python-jobspy not installed", file=sys.stderr)
+        return _failure(STATUS_FAILED, "jobspy_missing")
+    try:
+        frame = scrape_jobs(
+            site_name=["indeed"],
+            search_term=term,
+            location=place,
+            country_indeed="Spain",
+            results_wanted=_INDEED_RESULTS,
+            hours_old=72,
+            verbose=0,
+        )
+        records = list(frame.to_dict("records")) if not getattr(frame, "empty", False) else []
+        errors = (getattr(frame, "attrs", None) or {}).get("errors")
+    except Exception as exc:  # noqa: BLE001  (third-party library: never crash the run)
+        print(f"[sources] indeed failed ({type(exc).__name__})", file=sys.stderr)
+        return _failure(STATUS_FAILED, "jobspy_error")
+
+    results: list[dict] = []
+    seen: set[str] = set()
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        url = _text(rec.get("job_url"))
+        raw_id = _text(rec.get("id"))
+        jk_match = _INDEED_JK_RE.search(url)
+        job_id = (raw_id[3:] if raw_id.startswith("in-") else raw_id) or (
+            jk_match.group(1) if jk_match else ""
+        )
+        if not job_id or job_id in seen:
+            continue
+        if not url:
+            url = f"https://es.indeed.com/viewjob?jk={job_id}"
+        seen.add(job_id)
+        description = _text(rec.get("description"))
+        item = {
+            "id": f"in-{job_id}",
+            "title": _text(rec.get("title")),
+            "company": _text(rec.get("company")),
+            "location": _text(rec.get("location")),
+            "url": url,
+            "snippet": "",
+            "source": "indeed",
+            "query": query,
+            "description": description,
+        }
+        results.append(item)
+        if description:
+            _POSTING_CACHE[url] = {"text": description, "company": item["company"]}
+    if not results and errors:
+        return _indeed_error_result(errors if isinstance(errors, (list, tuple)) else [errors])
+    return SourceResult(results)
+
+
+# ---------------------------------------------------------------- InfoJobs
+# Port of the HTML parsing and request headers of the reviewed InfoJobs
+# connector helpers.ts (MIT licence), repo
+# https://github.com/erikpr1994/ai-job-search , commit 0d019f2.
+# Personal use only: InfoJobs' ToS restricts automated access.
+INFOJOBS_SEARCH_URL = "https://www.infojobs.net/jobsearch/search-results/list.xhtml"
+INFOJOBS_DETAIL_BASE = "https://www.infojobs.net/empleo/empleo"
+INFOJOBS_TIMEOUT = 15
+INFOJOBS_RETRY_SECONDS = 2
+INFOJOBS_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+}
+_CAPTCHA_MARKERS = (
+    "captcha", "geetest", "datadome", "px-captcha", "unusual traffic",
+    "acceso denegado", "access denied", "verifica que eres humano",
+)
+_IJ_LINK_RE = re.compile(
+    r'class="ij-OfferCardContent-description-link[^"]*"[^>]*href="([^"]+)"', re.I
+)
+_IJ_TITLE_RE = re.compile(
+    r'class="ij-OfferCardContent-description-title-link"[^>]*>(.*?)</span>', re.I | re.S
+)
+_IJ_ARIA_RE = re.compile(
+    r'class="ij-OfferCardContent-description-link[^"]*"[^>]*aria-label="([^"]*)"', re.I
+)
+_IJ_SUB_RE = re.compile(
+    r'class="ij-OfferCardContent-description-subtitle"[^>]*>(.*?)</h3>', re.I | re.S
+)
+_IJ_LOC_RE = re.compile(
+    r'class="ij-OfferCardContent-description-list-item-truncate"[^>]*>(.*?)</span>',
+    re.I | re.S,
+)
+_IJ_ITEM_RE = re.compile(
+    r'class="ij-OfferCardContent-description-list-item"[^>]*>(.*?)</li>', re.I | re.S
+)
+_IJ_DESC_RE = re.compile(r"Descripci[oó]n</h3>(.*?)</article>", re.I | re.S)
+_IJ_DETAIL_TITLE_RE = re.compile(
+    r'class="[^"]*ij-Heading-title1[^"]*"[^>]*>(.*?)</h1>', re.I | re.S
+)
+
+
+def _ij_url(href: str) -> str:
+    url = unescape(href).split("?")[0].strip()
+    if url.startswith("//"):
+        url = "https:" + url
+    elif url.startswith("/"):
+        url = "https://www.infojobs.net" + url
+    return url
+
+
+def _ij_get(session, url: str, params: dict | None):
+    """GET with at most ONE retry on 429/5xx. Returns Response or SourceResult."""
+    response = None
+    for attempt in range(2):
+        try:
+            response = session.get(
+                url, params=params, timeout=INFOJOBS_TIMEOUT, allow_redirects=True
+            )
+        except requests.RequestException as exc:
+            print(f"[sources] infojobs request failed ({type(exc).__name__})", file=sys.stderr)
+            return _request_failure(exc)
+        code = response.status_code
+        if (code == 429 or code >= 500) and attempt == 0:
+            time.sleep(INFOJOBS_RETRY_SECONDS)
+            continue
+        break
+    if response.status_code != 200:
+        print(f"[sources] infojobs HTTP {response.status_code}", file=sys.stderr)
+        return _http_failure(response.status_code)
+    return response
+
+
+def _parse_infojobs(html_text: str, query: str) -> list[dict]:
+    results: list[dict] = []
+    seen: set[str] = set()
+    for chunk in html_text.split('id="job-title-')[1:]:
+        id_match = re.match(r'([0-9a-f]+)"', chunk, re.I)
+        if not id_match:
+            continue
+        job_id = id_match.group(1).lower()
+        if job_id in seen:
+            continue
+        link = _IJ_LINK_RE.search(chunk)
+        url = _ij_url(link.group(1)) if link else f"{INFOJOBS_DETAIL_BASE}/of-i{job_id}"
+        title_match = _IJ_TITLE_RE.search(chunk)
+        title = clean(title_match.group(1)) if title_match else ""
+        if not title:
+            aria = _IJ_ARIA_RE.search(chunk)
+            title = unescape(aria.group(1)).strip() if aria else ""
+        if not title:
+            continue
+        seen.add(job_id)
+        sub = _IJ_SUB_RE.search(chunk)
+        company = clean(sub.group(1)) if sub else ""
+        loc = _IJ_LOC_RE.search(chunk)
+        location = clean(loc.group(1)) if loc else ""
+        modality = ""
+        for li in _IJ_ITEM_RE.finditer(chunk):
+            text = clean(li.group(1))
+            if text and not re.search(r"truncate|FormatterSincedate", li.group(1), re.I) \
+                    and text != location:
+                modality = text
+                break
+        _POSTING_CACHE.setdefault(url, {"text": "", "company": company})
+        results.append({
+            "id": f"ij-{job_id}",
+            "title": title,
+            "company": company,
+            "location": location,
+            "url": url,
+            "snippet": modality,
+            "source": "infojobs",
+            "query": query,
+        })
+    return results
+
+
+def search_infojobs(query: str, location: str | None = None) -> SourceResult:
+    """One InfoJobs search page for one query (never raises, max 1 page).
+
+    The location is appended to the keyword (no evidenced location
+    parameter); the scraper's location filter drops other provinces.
+    """
+    keyword = " ".join(str(query).split())
+    if not keyword:
+        return _failure(STATUS_FAILED, "invalid_query")
+    if location and not _is_remote_place(location):
+        keyword = f"{keyword} {location}"
+    response = _ij_get(
+        make_infojobs_session(),
+        INFOJOBS_SEARCH_URL,
+        {"keyword": keyword, "sinceDate": "_7_DAYS"},
+    )
+    if isinstance(response, SourceResult):
+        return response
+    html_text = response.text
+    items = _parse_infojobs(html_text, query)
+    if not items:
+        folded = html_text.lower()
+        if any(marker in folded for marker in _CAPTCHA_MARKERS):
+            print("[sources] infojobs anti-bot page", file=sys.stderr)
+            return _failure(STATUS_BLOCKED, "captcha")
+        return SourceResult([])
+    return SourceResult(items)
+
+
+def make_infojobs_session() -> requests.Session:
+    session = make_session()
+    session.headers.update(INFOJOBS_HEADERS)
+    return session
+
+
+def fetch_infojobs_detail(url: str) -> str:
+    """Description text of one InfoJobs offer page ('' on any failure)."""
+    response = _ij_get(make_infojobs_session(), url, None)
+    if isinstance(response, SourceResult):
+        return ""
+    html_text = response.text
+    desc = _IJ_DESC_RE.search(html_text)
+    if not desc:
+        return ""
+    with_breaks = re.sub(r"<\s*br\s*/?>", "\n", desc.group(1), flags=re.I)
+    with_breaks = re.sub(r"</(p|li|ul|ol|div|h\d)>", "\n", with_breaks, flags=re.I)
+    lines = [_WS_RE.sub(" ", unescape(_TAG_RE.sub(" ", l))).strip() for l in with_breaks.split("\n")]
+    body = "\n".join(l for l in lines if l)
+    title = _IJ_DETAIL_TITLE_RE.search(html_text)
+    head = clean(title.group(1)) if title else ""
+    return f"{head}\n{body}".strip() if body else ""
+
 # Registry of connected portals. Enabled portals live in
 # preferences.json ("sources"); anything not listed here cannot be
 # enabled and is recorded as a <<PETICION>> request instead.
 SOURCES = {
     "turijobs": search_turijobs,
     "linkedin": search_linkedin,
+    "indeed": search_indeed,
+    "infojobs": search_infojobs,
 }
-# Portals whose endpoint takes a location (evidenced above for LinkedIn).
-LOCATION_AWARE = {"linkedin"}
+# Portals whose search takes a location (LinkedIn param, Indeed param,
+# InfoJobs keyword suffix).
+LOCATION_AWARE = {"linkedin", "indeed", "infojobs"}
 
 
 def valid_source(name) -> bool:

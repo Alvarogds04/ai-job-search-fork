@@ -252,7 +252,7 @@ def _selftest() -> int:
             {"extra_queries": ["x"]},
             {"extra_queries": ["ok"] * 7},
             {"sources": []},                  # quitar_fuente leaving none
-            {"sources": ["infojobs"]},        # portal not in the registry
+            {"sources": ["jooble"]},          # portal not in the registry
             {"sources": "turijobs"},          # not a list
             {"sources": ["turijobs", 42]},    # non-string entry
             {"roles": ["x"]},
